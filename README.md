@@ -1,4 +1,4 @@
-# smart_road# Smart Adaptive Traffic Intersection — STEM Demo
+# Smart Adaptive Traffic Intersection — STEM Demo
 
 > A complete, classroom-friendly project that uses **Python + OpenCV** to count cars, runs a simple **adaptive 2-phase algorithm** (NS vs EW), and controls **ESP32 traffic lights** and **line-follower smart cars** over **MQTT**.
 

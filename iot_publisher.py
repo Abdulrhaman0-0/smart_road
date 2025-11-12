@@ -6,7 +6,10 @@
 #   - signals/cycle  -> "CYCLE <ORDER> <NS> <EW> <AMBER> <ALLRED>"
 #   - cars/N,S,E,W   -> "GO <ms>" or "STOP"
 
-import time, json
+import time
+import uuid
+import traceback
+
 import paho.mqtt.client as mqtt
 from vision_select_and_count import count_stream
 from algo_two_phase import plan_cycle
