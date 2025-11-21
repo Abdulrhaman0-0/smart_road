@@ -1,12 +1,21 @@
-"""MQTT publisher that glues the vision counts, planning algorithm, and IoT devices."""
+# ==============
+# iot_publisher.py
+# ==============
+# Orchestrates Vision + Algorithm + MQTT publishing.
+# Publishes:
+#   - signals/cycle  -> "CYCLE <ORDER> <NS> <EW> <AMBER> <ALLRED>"
+#   - cars/N,S,E,W   -> "GO <ms>" or "STOP"
+#
+# Requirements:
+#   pip install paho-mqtt
+#
+# Tip: run vision_select_and_count.py once to store ROIs, then run this.
 
 from __future__ import annotations
 
-import argparse
-import os
-import signal
-import sys
-import threading
+import time
+import uuid
+import traceback
 from typing import Dict
 
 import paho.mqtt.client as mqtt
@@ -14,119 +23,181 @@ import paho.mqtt.client as mqtt
 from algo_two_phase import Cycle, plan_cycle
 from vision_select_and_count import count_stream
 
-DEFAULT_BROKER = os.getenv("SMART_ROAD_BROKER", "broker.emqx.io")
-DEFAULT_PORT = int(os.getenv("SMART_ROAD_PORT", "1883"))
-TOPIC_CYCLE = os.getenv("SMART_ROAD_TOPIC_CYCLE", "signals/cycle")
-TOPIC_CARS = {
-    "N": os.getenv("SMART_ROAD_TOPIC_CAR_N", "cars/N"),
-    "S": os.getenv("SMART_ROAD_TOPIC_CAR_S", "cars/S"),
-    "E": os.getenv("SMART_ROAD_TOPIC_CAR_E", "cars/E"),
-    "W": os.getenv("SMART_ROAD_TOPIC_CAR_W", "cars/W"),
+# ---------- MQTT settings ----------
+BROKER_HOST = "broker.emqx.io"
+BROKER_PORT = 1883
+
+# A readable prefix; we add a random suffix to avoid collisions across laptops/instances.
+CLIENT_ID_PREFIX = "laptop_traffic_pub"
+
+TOPIC_CYCLE = "signals/cycle"
+TOPIC_CARS: Dict[str, str] = {
+    "N": "cars/N",
+    "S": "cars/S",
+    "E": "cars/E",
+    "W": "cars/W",
 }
 
-
-class TrafficPublisher:
-    def __init__(self, host: str, port: int, client_id: str | None = None) -> None:
-        self.host = host
-        self.port = port
-        self.client = mqtt.Client(client_id=client_id or "smart-road-pub", clean_session=True)
-        self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.reconnect_delay_set(min_delay=1, max_delay=5)
-        self.connected = threading.Event()
-        self._stop = threading.Event()
-        self.client.will_set(TOPIC_CYCLE, "CYCLE NS 5000 5000 2000 1000", qos=0, retain=False)
-
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            print(f"[mqtt] Connected to {self.host}:{self.port}")
-            self.connected.set()
-        else:
-            print(f"[mqtt] Failed to connect (rc={rc})")
-
-    def _on_disconnect(self, client, userdata, rc):
-        self.connected.clear()
-        if rc != 0:
-            print(f"[mqtt] Unexpected disconnect (rc={rc}); will retry.")
-
-    def start(self) -> None:
-        self.client.connect_async(self.host, self.port, keepalive=30)
-        self.client.loop_start()
-
-    def stop(self) -> None:
-        if self._stop.is_set():
-            return
-        self._stop.set()
-        try:
-            for direction in TOPIC_CARS:
-                self.client.publish(TOPIC_CARS[direction], "STOP", qos=1, retain=False)
-        finally:
-            self.client.loop_stop()
-            self.client.disconnect()
-
-    def publish_cycle(self, cycle: Cycle) -> bool:
-        if not self.connected.wait(timeout=5):
-            print("[mqtt] Still offline; skipping cycle publish.")
-            return False
-        payload = f"CYCLE {cycle.order} {cycle.ns_green_ms} {cycle.ew_green_ms} {cycle.amber_ms} {cycle.allred_ms}"
-        result = self.client.publish(TOPIC_CYCLE, payload, qos=1, retain=False)
-        result.wait_for_publish()
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            print(f"[mqtt] Failed to publish cycle (rc={result.rc})")
-            return False
-        if cycle.order == "NS":
-            self._publish_car("N", f"GO {cycle.ns_green_ms}")
-            self._publish_car("S", f"GO {cycle.ns_green_ms}")
-            self._publish_car("E", "STOP")
-            self._publish_car("W", "STOP")
-        else:
-            self._publish_car("E", f"GO {cycle.ew_green_ms}")
-            self._publish_car("W", f"GO {cycle.ew_green_ms}")
-            self._publish_car("N", "STOP")
-            self._publish_car("S", "STOP")
+# ---------- Reconnect/backoff helpers ----------
+def ensure_connected(client: mqtt.Client, max_backoff: int = 10) -> bool:
+    """
+    Ensure the client is connected; try reconnect with incremental backoff.
+    Returns True when connected, False if a fatal error occurred.
+    """
+    if client.is_connected():
         return True
 
-    def _publish_car(self, direction: str, payload: str) -> None:
-        topic = TOPIC_CARS[direction]
-        result = self.client.publish(topic, payload, qos=1, retain=False)
-        result.wait_for_publish()
-        if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            print(f"[mqtt] Failed to publish car cmd ({topic} -> {payload})")
+    backoff = 1
+    while not client.is_connected() and backoff <= max_backoff:
+        try:
+            # In paho, reconnect() is used after loop_start()
+            rc = client.reconnect()
+            if rc == mqtt.MQTT_ERR_SUCCESS:
+                return True
+            print(f"[mqtt] reconnect rc={rc}; retrying in {backoff}s")
+        except Exception as e:
+            print(f"[mqtt] reconnect exception: {e}; retrying in {backoff}s")
+        time.sleep(backoff)
+        backoff = min(max_backoff, backoff * 2)
+
+    return client.is_connected()
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Smart Road MQTT publisher")
-    parser.add_argument("--broker", default=DEFAULT_BROKER, help="MQTT broker host")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="MQTT broker port")
-    parser.add_argument("--client-id", default=None, help="MQTT client id")
-    return parser.parse_args()
+def safe_publish(
+    client: mqtt.Client,
+    topic: str,
+    payload: str,
+    qos: int = 1,
+    retain: bool = False,
+) -> bool:
+    """
+    Publish with error checks. Returns True on success, False otherwise.
+    """
+    try:
+        info = client.publish(topic, payload, qos=qos, retain=retain)
+        # info.rc is immediate status; wait_for_publish ensures QoS handshake locally
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            print(f"[mqtt] publish rc={info.rc} topic={topic}")
+            return False
+        info.wait_for_publish(timeout=3.0)
+        if not info.is_published():
+            print(f"[mqtt] not published within timeout topic={topic}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[mqtt] publish exception on {topic}: {e}")
+        return False
+
+
+# ---------- MQTT callbacks (optional logs) ----------
+def _on_connect(
+    client: mqtt.Client,
+    userdata,
+    flags,
+    rc,
+    properties=None,
+) -> None:
+    print(f"[mqtt] connected rc={rc}")
+
+
+def _on_disconnect(
+    client: mqtt.Client,
+    userdata,
+    rc,
+    properties=None,
+) -> None:
+    print(f"[mqtt] disconnected rc={rc}")
+
+
+# ---------- Core publishing ----------
+def _publish_cycle(client: mqtt.Client, cyc: Cycle) -> bool:
+    """
+    Publish one full cycle:
+      1) signals/cycle line
+      2) cars/* GO/STOP according to order
+    """
+    # 1) signals/cycle
+    msg = (
+        f"CYCLE {cyc.order} {cyc.ns_green_ms} {cyc.ew_green_ms} "
+        f"{cyc.amber_ms} {cyc.allred_ms}"
+    )
+    ok1 = safe_publish(client, TOPIC_CYCLE, msg, qos=1, retain=False)
+    print(("[signals] OK  " if ok1 else "[signals] FAIL"), msg)
+
+    # 2) cars
+    if cyc.order == "NS":
+        ns_ms = cyc.ns_green_ms
+        ok2 = safe_publish(client, TOPIC_CARS["N"], f"GO {ns_ms}", qos=1)
+        ok3 = safe_publish(client, TOPIC_CARS["S"], f"GO {ns_ms}", qos=1)
+        ok4 = safe_publish(client, TOPIC_CARS["E"], "STOP", qos=1)
+        ok5 = safe_publish(client, TOPIC_CARS["W"], "STOP", qos=1)
+    else:
+        ew_ms = cyc.ew_green_ms
+        ok2 = safe_publish(client, TOPIC_CARS["E"], f"GO {ew_ms}", qos=1)
+        ok3 = safe_publish(client, TOPIC_CARS["W"], f"GO {ew_ms}", qos=1)
+        ok4 = safe_publish(client, TOPIC_CARS["N"], "STOP", qos=1)
+        ok5 = safe_publish(client, TOPIC_CARS["S"], "STOP", qos=1)
+
+    all_ok = ok1 and ok2 and ok3 and ok4 and ok5
+    if not all_ok:
+        print("[mqtt] one or more publishes failed in this cycle")
+    return all_ok
 
 
 def main() -> None:
-    args = _parse_args()
-    publisher = TrafficPublisher(host=args.broker, port=args.port, client_id=args.client_id)
-    publisher.start()
+    # Build unique client id to avoid broker collisions if you run multiple instances.
+    unique_id = f"{CLIENT_ID_PREFIX}_{uuid.uuid4().hex[:6]}"
+    client = mqtt.Client(client_id=unique_id, clean_session=True)
+    client.on_connect = _on_connect
+    client.on_disconnect = _on_disconnect
 
-    stop_requested = threading.Event()
+    # First connect (with robust error handling)
+    try:
+        rc = client.connect(BROKER_HOST, BROKER_PORT, keepalive=30)
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            print(f"[mqtt] connect failed rc={rc}")
+            return
+    except Exception:
+        print("[mqtt] connect exception:")
+        traceback.print_exc()
+        return
 
-    def _handle_stop(signum, frame):
-        stop_requested.set()
-
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
+    # Network thread
+    client.loop_start()
 
     last_order = "NS"
     try:
         for counts in count_stream():
-            if stop_requested.is_set():
-                break
-            cycle = plan_cycle(counts["N"], counts["S"], counts["E"], counts["W"], last_order)
-            if publisher.publish_cycle(cycle):
-                last_order = cycle.order
+            # Ensure MQTT is connected before publishing
+            if not ensure_connected(client):
+                print("[mqtt] unable to reconnect; skipping this tick")
+                continue
+
+            # counts is a dict like {"N": n, "S": s, "E": e, "W": w}
+            cyc = plan_cycle(
+                counts["N"],
+                counts["S"],
+                counts["E"],
+                counts["W"],
+                last_order=last_order,
+            )
+            ok = _publish_cycle(client, cyc)
+            if ok:
+                last_order = cyc.order
+            # Vision already paces the loop; no extra sleep here.
+
     except KeyboardInterrupt:
-        pass
+        print("\n[main] interrupted by user")
+    except Exception:
+        print("[main] exception:")
+        traceback.print_exc()
     finally:
-        publisher.stop()
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
+        print("[main] clean exit")
 
 
 if __name__ == "__main__":
