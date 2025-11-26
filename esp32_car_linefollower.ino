@@ -5,7 +5,7 @@
 // Commands:
 //   - "GO <ms>" -> enable motion with timeout
 //   - "STOP"    -> immediate stop
-// Drives L298N with a simple 3-IR line follower (fixed threshold).
+// Drives L298N with a simple 2-IR line follower (fixed threshold, no PWM).
 //
 // >>> IMPORTANT: SET YOUR UNIQUE MQTT CLIENT ID HERE (to avoid collisions):
 // const char* MQTT_CLIENT_ID = "car_<YOUR_UNIQUE_ID>";  // e.g., car_N_21A3
@@ -31,36 +31,37 @@ PubSubClient mqtt(net);
 const int ENA=25, IN1=26, IN2=27;   // left motor
 const int ENB=14, IN3=12, IN4=13;   // right motor
 
-// ---------- LEDC PWM ----------
-const int PWM_CH_L = 0;
-const int PWM_CH_R = 1;
-const int PWM_BITS = 8;             // duty 0..255
-const int PWM_FREQ = 20000;         // 20 kHz (quiet)
-
 // ---------- IR pins & threshold ----------
-const int IR_L=34, IR_C=35, IR_R=32;  // 34/35 input-only (ADC)
+const int IR_L=34, IR_R=32;           // using only two IR sensors
 int IR_TH = 1800;                     // analog threshold (tune with your sensors)
 
 // ---------- Motion ----------
-int PWM_SPEED = 150;                // 0..255
 bool allowed = false;
 uint32_t goUntil = 0;
 
 // ---------- Helpers ----------
 void motorStop(){
-  ledcWrite(PWM_CH_L, 0);
-  ledcWrite(PWM_CH_R, 0);
+  digitalWrite(ENA, LOW); digitalWrite(ENB, LOW);
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
 }
-void motorForward(int lpwm, int rpwm){
+void motorForward(){
+  digitalWrite(ENA, HIGH); digitalWrite(ENB, HIGH);
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  ledcWrite(PWM_CH_L, lpwm);
-  ledcWrite(PWM_CH_R, rpwm);
 }
-void motorLeft(){   motorForward((int)(PWM_SPEED*0.7), PWM_SPEED); }
-void motorRight(){  motorForward(PWM_SPEED, (int)(PWM_SPEED*0.7)); }
+void motorLeft(){
+  // slow pivot left by stopping the left motor
+  digitalWrite(ENA, LOW);  digitalWrite(ENB, HIGH);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorRight(){
+  // slow pivot right by stopping the right motor
+  digitalWrite(ENA, HIGH); digitalWrite(ENB, LOW);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+}
 
 int readAveraged(int pin, int samples=8){
   int sum = 0;
@@ -105,19 +106,12 @@ void setup(){
   Serial.begin(115200);
 
   // Motor pins
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
-
-  // LEDC PWM setup
-  ledcSetup(PWM_CH_L, PWM_FREQ, PWM_BITS);
-  ledcSetup(PWM_CH_R, PWM_FREQ, PWM_BITS);
-  ledcAttachPin(ENA, PWM_CH_L); ledcWrite(PWM_CH_L, 0);
-  ledcAttachPin(ENB, PWM_CH_R); ledcWrite(PWM_CH_R, 0);
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
   // IR inputs + ADC attenuation (better 0..3.3V range)
-  pinMode(IR_L, INPUT); pinMode(IR_C, INPUT); pinMode(IR_R, INPUT);
+  pinMode(IR_L, INPUT); pinMode(IR_R, INPUT);
   analogSetPinAttenuation(IR_L, ADC_11db);
-  analogSetPinAttenuation(IR_C, ADC_11db);
   analogSetPinAttenuation(IR_R, ADC_11db);
   // analogReadResolution(12); // default 12-bit; uncomment if you change
 
@@ -149,21 +143,19 @@ void loop(){
     return;
   }
 
-  // --- 3-IR line-following ---
+  // --- 2-IR line-following ---
   int l = readAveraged(IR_L, 8);
-  int c = readAveraged(IR_C, 8);
   int r = readAveraged(IR_R, 8);
-  bool onL = (l < IR_TH), onC = (c < IR_TH), onR = (r < IR_TH);
+  bool onL = (l < IR_TH), onR = (r < IR_TH);
 
-  if (onC && !onL && !onR){
-    motorForward(PWM_SPEED, PWM_SPEED);
-  } else if (onL && !onR){
+  if (onL && onR){
+    motorForward();
+  } else if (onL){
     motorLeft();
-  } else if (onR && !onL){
+  } else if (onR){
     motorRight();
   } else {
-    // ambiguous: go slower straight
-    motorForward((int)(PWM_SPEED*0.6), (int)(PWM_SPEED*0.6));
+    motorStop();
   }
 
   delay(5);
