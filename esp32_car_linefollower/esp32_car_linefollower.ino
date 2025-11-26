@@ -2,163 +2,43 @@
 #include <PubSubClient.h>
 #include <cstring>
 #include <cstdlib>
-#include <esp32-hal-ledc.h>
+
 // --------------- User configuration ----------------
 const char* WIFI_SSID = "YOUR_SSID";
 const char* WIFI_PASS = "YOUR_PASSWORD";
 
 const char* MQTT_HOST = "broker.emqx.io";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_CLIENT_ID = "esp32_signals_controller";
-const char* TOPIC_CYCLE = "signals/cycle";
+const char* MQTT_CLIENT_ID = "esp32_car";
+const char* CAR_TOPIC = "cars/N";  // change per car (cars/N, cars/S, cars/E, cars/W)
 
-// Pin mapping for each signal head (two per direction group)
-struct SignalPins {
-  uint8_t red;
-  uint8_t yellow;
-  uint8_t green;
-};
+// Motor pins (L298N)
+const int PIN_ENA = 25;
+const int PIN_IN1 = 26;
+const int PIN_IN2 = 27;
+const int PIN_ENB = 14;
+const int PIN_IN3 = 12;
+const int PIN_IN4 = 13;
 
-SignalPins NS_SIGNALS[] = {
-  {21, 22, 23},  // North
-  {19, 18, 5}    // South
-};
+// Line sensors (analog)
+const int PIN_IR_LEFT   = 34;
+const int PIN_IR_CENTER = 35;
+const int PIN_IR_RIGHT  = 32;
 
-SignalPins EW_SIGNALS[] = {
-  {25, 26, 27},  // East
-  {32, 33, 4}    // West
-};
+// PWM configuration
+const int PWM_FREQ = 2000;
+const int PWM_RES  = 8;      // bits
+const int BASE_SPEED = 200;  // 0-255
+const int TURN_SPEED = 150;  // slower speed for correcting
+const int IR_THRESHOLD = 1800;  // adjust depending on tape/lighting
 
-// Timing defaults / fail-safe
-const uint32_t DEFAULT_NS_GREEN = 9000;
-const uint32_t DEFAULT_EW_GREEN = 9000;
-const uint32_t DEFAULT_AMBER = 2000;
-const uint32_t DEFAULT_ALL_RED = 1000;
-const uint32_t FAILSAFE_MS = 15000;
+// ----------------------------------------------------
 
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 
-struct CycleSpec {
-  bool nsFirst;
-  uint32_t nsGreen;
-  uint32_t ewGreen;
-  uint32_t amber;
-  uint32_t allRed;
-};
-
-enum Phase {
-  PHASE_NS_GREEN,
-  PHASE_NS_AMBER,
-  PHASE_ALL_RED_TO_EW,
-  PHASE_EW_GREEN,
-  PHASE_EW_AMBER,
-  PHASE_ALL_RED_TO_NS
-};
-
-CycleSpec activeCycle = {true, DEFAULT_NS_GREEN, DEFAULT_EW_GREEN, DEFAULT_AMBER, DEFAULT_ALL_RED};
-CycleSpec pendingCycle;
-bool hasPendingCycle = false;
-
-Phase currentPhase = PHASE_NS_GREEN;
-unsigned long phaseStarted = 0;
-uint32_t phaseDuration = DEFAULT_NS_GREEN;
-unsigned long lastCycleRx = 0;
-
-// ---------------- Helper routines ----------------
-
-void setSignalPins(const SignalPins& pins, bool redOn, bool yellowOn, bool greenOn) {
-  digitalWrite(pins.red, redOn ? HIGH : LOW);
-  digitalWrite(pins.yellow, yellowOn ? HIGH : LOW);
-  digitalWrite(pins.green, greenOn ? HIGH : LOW);
-}
-
-void setGroup(SignalPins* group, size_t count, bool redOn, bool yellowOn, bool greenOn) {
-  for (size_t i = 0; i < count; ++i) {
-    setSignalPins(group[i], redOn, yellowOn, greenOn);
-  }
-}
-
-void allRed() {
-  setGroup(NS_SIGNALS, 2, true, false, false);
-  setGroup(EW_SIGNALS, 2, true, false, false);
-}
-
-uint32_t durationForPhase(const CycleSpec& spec, Phase phase) {
-  switch (phase) {
-    case PHASE_NS_GREEN: return spec.nsGreen;
-    case PHASE_NS_AMBER: return spec.amber;
-    case PHASE_ALL_RED_TO_EW: return spec.allRed;
-    case PHASE_EW_GREEN: return spec.ewGreen;
-    case PHASE_EW_AMBER: return spec.amber;
-    case PHASE_ALL_RED_TO_NS: return spec.allRed;
-  }
-  return DEFAULT_NS_GREEN;
-}
-
-Phase nextPhase(Phase phase) {
-  switch (phase) {
-    case PHASE_NS_GREEN: return PHASE_NS_AMBER;
-    case PHASE_NS_AMBER: return PHASE_ALL_RED_TO_EW;
-    case PHASE_ALL_RED_TO_EW: return PHASE_EW_GREEN;
-    case PHASE_EW_GREEN: return PHASE_EW_AMBER;
-    case PHASE_EW_AMBER: return PHASE_ALL_RED_TO_NS;
-    case PHASE_ALL_RED_TO_NS: return PHASE_NS_GREEN;
-  }
-  return PHASE_NS_GREEN;
-}
-
-void applyOutputsForPhase(Phase phase) {
-  switch (phase) {
-    case PHASE_NS_GREEN:
-      setGroup(NS_SIGNALS, 2, false, false, true);
-      setGroup(EW_SIGNALS, 2, true, false, false);
-      break;
-    case PHASE_NS_AMBER:
-      setGroup(NS_SIGNALS, 2, false, true, false);
-      setGroup(EW_SIGNALS, 2, true, false, false);
-      break;
-    case PHASE_ALL_RED_TO_EW:
-    case PHASE_ALL_RED_TO_NS:
-      allRed();
-      break;
-    case PHASE_EW_GREEN:
-      setGroup(EW_SIGNALS, 2, false, false, true);
-      setGroup(NS_SIGNALS, 2, true, false, false);
-      break;
-    case PHASE_EW_AMBER:
-      setGroup(EW_SIGNALS, 2, false, true, false);
-      setGroup(NS_SIGNALS, 2, true, false, false);
-      break;
-  }
-}
-
-void beginPhase(Phase phase, const CycleSpec& spec) {
-  currentPhase = phase;
-  phaseDuration = durationForPhase(spec, phase);
-  phaseStarted = millis();
-  applyOutputsForPhase(phase);
-}
-
-void activateCycle(const CycleSpec& spec) {
-  activeCycle = spec;
-  Phase startPhase = spec.nsFirst ? PHASE_NS_GREEN : PHASE_EW_GREEN;
-  beginPhase(startPhase, activeCycle);
-  lastCycleRx = millis();
-  hasPendingCycle = false;
-}
-
-CycleSpec defaultCycle() {
-  CycleSpec spec;
-  spec.nsFirst = true;
-  spec.nsGreen = DEFAULT_NS_GREEN;
-  spec.ewGreen = DEFAULT_EW_GREEN;
-  spec.amber = DEFAULT_AMBER;
-  spec.allRed = DEFAULT_ALL_RED;
-  return spec;
-}
-
-// ---------------- Networking ----------------
+bool runActive = false;
+unsigned long runEndsAt = 0;
 
 void ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -179,7 +59,7 @@ void ensureMqtt() {
     Serial.print("Connecting to MQTT...");
     if (mqtt.connect(MQTT_CLIENT_ID)) {
       Serial.println("connected");
-      mqtt.subscribe(TOPIC_CYCLE);
+      mqtt.subscribe(CAR_TOPIC);
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqtt.state());
@@ -189,96 +69,140 @@ void ensureMqtt() {
   }
 }
 
-void handleCycleMessage(const char* payload) {
-  char order[4] = {0};
-  unsigned long nsMs = 0, ewMs = 0, amberMs = 0, allredMs = 0;
-  int parsed = sscanf(payload, "CYCLE %3s %lu %lu %lu %lu", order, &nsMs, &ewMs, &amberMs, &allredMs);
-  if (parsed != 5) {
-    Serial.print("Invalid cycle payload: ");
-    Serial.println(payload);
-    return;
+void setMotors(int leftSpeed, int rightSpeed, int leftDir, int rightDir) {
+  leftSpeed  = constrain(leftSpeed, 0, 255);
+  rightSpeed = constrain(rightSpeed, 0, 255);
+
+  // leftDir/rightDir: 0 = stop, 1 = forward, 2 = backward
+  digitalWrite(PIN_IN1, (leftDir == 1) ? HIGH : LOW);
+  digitalWrite(PIN_IN2, (leftDir == 2) ? HIGH : LOW);
+  digitalWrite(PIN_IN3, (rightDir == 1) ? HIGH : LOW);
+  digitalWrite(PIN_IN4, (rightDir == 2) ? HIGH : LOW);
+
+  // With ESP32 core 3.x: use pin directly in ledcWrite
+  ledcWrite(PIN_ENA, leftSpeed);
+  ledcWrite(PIN_ENB, rightSpeed);
+}
+
+void stopMotors() {
+  ledcWrite(PIN_ENA, 0);
+  ledcWrite(PIN_ENB, 0);
+
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, LOW);
+}
+
+bool readSensor(int pin) {
+  int value = analogRead(pin);
+  // line assumed darker (lower reading)
+  return value < IR_THRESHOLD;
+}
+
+void followLine() {
+  bool left   = readSensor(PIN_IR_LEFT);
+  bool center = readSensor(PIN_IR_CENTER);
+  bool right  = readSensor(PIN_IR_RIGHT);
+
+  if (center) {
+    // go straight
+    setMotors(BASE_SPEED, BASE_SPEED, 1, 1);
+  } else if (left && !right) {
+    // turn left
+    setMotors(TURN_SPEED, BASE_SPEED, 1, 1);
+  } else if (right && !left) {
+    // turn right
+    setMotors(BASE_SPEED, TURN_SPEED, 1, 1);
+  } else if (left && right) {
+    // both see line: slow straight (junction or thick line)
+    setMotors(TURN_SPEED, TURN_SPEED, 1, 1);
+  } else {
+    // lost line: stop
+    stopMotors();
   }
-  CycleSpec spec;
-  spec.nsFirst = (strncmp(order, "NS", 2) == 0);
-  spec.nsGreen = (uint32_t)nsMs;
-  spec.ewGreen = (uint32_t)ewMs;
-  spec.amber = (uint32_t)amberMs;
-  spec.allRed = (uint32_t)allredMs;
-  pendingCycle = spec;
-  hasPendingCycle = true;
-  lastCycleRx = millis();
-  Serial.printf("Queued cycle: order=%s NS=%lu EW=%lu amber=%lu allred=%lu\n", order, nsMs, ewMs, amberMs, allredMs);
+}
+
+void handleCommand(const char* payload) {
+  if (strncmp(payload, "GO", 2) == 0) {
+    unsigned long duration = strtoul(payload + 2, nullptr, 10);
+    if (duration == 0) {
+      Serial.println("GO command missing duration");
+      return;
+    }
+    runActive = true;
+    runEndsAt = millis() + duration;
+    Serial.printf("GO for %lu ms\n", duration);
+  } else if (strncmp(payload, "STOP", 4) == 0) {
+    runActive = false;
+    stopMotors();
+    Serial.println("STOP received");
+  } else {
+    Serial.print("Unknown payload: ");
+    Serial.println(payload);
+  }
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, TOPIC_CYCLE) != 0) {
+  if (strcmp(topic, CAR_TOPIC) != 0) {
     return;
   }
-  static char buffer[96];
+
+  static char buffer[48];
   size_t copyLen = length;
   if (copyLen >= sizeof(buffer)) {
     copyLen = sizeof(buffer) - 1;
   }
+
   memcpy(buffer, payload, copyLen);
   buffer[copyLen] = '\0';
-  handleCycleMessage(buffer);
+
+  handleCommand(buffer);
 }
 
-// ---------------- FSM update ----------------
-
-void updatePhases() {
+void updateRun() {
   unsigned long now = millis();
-  if (now - phaseStarted < phaseDuration) {
-    return;
+  if (runActive && now >= runEndsAt) {
+    runActive = false;
+    stopMotors();
+    Serial.println("Run window elapsed -> STOP");
   }
-  if ((currentPhase == PHASE_ALL_RED_TO_NS || currentPhase == PHASE_ALL_RED_TO_EW) && hasPendingCycle) {
-    activateCycle(pendingCycle);
-    return;
-  }
-  currentPhase = nextPhase(currentPhase);
-  if ((currentPhase == PHASE_NS_GREEN || currentPhase == PHASE_EW_GREEN) && hasPendingCycle) {
-    activateCycle(pendingCycle);
-    return;
-  }
-  beginPhase(currentPhase, activeCycle);
-}
 
-void checkFailsafe() {
-  unsigned long now = millis();
-  if (now - lastCycleRx > FAILSAFE_MS) {
-    Serial.println("Failsafe: reverting to default cycle");
-    activateCycle(defaultCycle());
+  if (runActive) {
+    followLine();
+  } else {
+    stopMotors();
   }
 }
-
-// ---------------- Arduino entry points ----------------
 
 void setup() {
   Serial.begin(115200);
-  for (SignalPins pins : NS_SIGNALS) {
-    pinMode(pins.red, OUTPUT);
-    pinMode(pins.yellow, OUTPUT);
-    pinMode(pins.green, OUTPUT);
-  }
-  for (SignalPins pins : EW_SIGNALS) {
-    pinMode(pins.red, OUTPUT);
-    pinMode(pins.yellow, OUTPUT);
-    pinMode(pins.green, OUTPUT);
-  }
-  allRed();
+
+  // Motor control pins
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+
+  // Line sensor pins
+  pinMode(PIN_IR_LEFT, INPUT);
+  pinMode(PIN_IR_CENTER, INPUT);
+  pinMode(PIN_IR_RIGHT, INPUT);
+
+  // PWM attach (new API in ESP32 core 3.x)
+  ledcAttach(PIN_ENA, PWM_FREQ, PWM_RES); // pin, freq, resolution bits
+  ledcAttach(PIN_ENB, PWM_FREQ, PWM_RES);
 
   ensureWifi();
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
   ensureMqtt();
-  activateCycle(activeCycle);
 }
 
 void loop() {
   ensureWifi();
   ensureMqtt();
   mqtt.loop();
-  updatePhases();
-  checkFailsafe();
+  updateRun();
   delay(5);
 }
