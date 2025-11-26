@@ -38,7 +38,18 @@ def _select_or_load_rois(frame) -> Dict[str, Tuple[int, int, int, int]]:
     if os.path.exists(ROI_CFG):
         with open(ROI_CFG, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return {k: tuple(map(int, v)) for k, v in data.items()}
+        rois = {k: tuple(map(int, v)) for k, v in data.items()}
+        expected = {"N", "S", "E", "W"}
+        if set(rois) != expected:
+            raise RuntimeError(
+                f"ROI config must contain exactly N, S, E, and W keys (found {sorted(rois)})."
+            )
+        for name, rect in rois.items():
+            if len(rect) != 4:
+                raise RuntimeError(
+                    f"ROI '{name}' must be a 4-tuple of (x, y, w, h); got {rect}."
+                )
+        return rois
 
     print("Select ROIs in order N, S, E, W (ENTER after each, ESC when done).")
     rois = cv2.selectROIs("Select 4 ROIs", frame, showCrosshair=True, fromCenter=False)
